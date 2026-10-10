@@ -357,14 +357,28 @@ class WallxModelWrapper:
 
         return inputs
 
-    def get_text_for_dllm_action(self, instruction):
+    def _present_cam_names(self, observation):
+        present = [
+            name
+            for name in self.cam_names
+            if isinstance(observation, dict) and observation.get(name) is not None
+        ]
+        if not present:
+            raise ValueError(
+                "No camera images in observation. "
+                f"Expected one of {list(self.cam_names)}."
+            )
+        return present
+
+    def get_text_for_dllm_action(self, instruction, cam_names=None):
+        cams = list(self.cam_names if cam_names is None else cam_names)
         if (
             self.config.train_config["data"].get("use_embodied_system_prompt_ratio", 0)
             > 0
         ):
             if self.norm_key != "x2_normal" and self.norm_key != "ex_normal":
                 self.config.robot_id = 0
-            cam_name_mapping = {cam_name: cam_name for cam_name in self.cam_names}
+            cam_name_mapping = {cam_name: cam_name for cam_name in cams}
             prologue = get_prologue_with_embodied_information(
                 dataset_name=self.norm_key,
                 cam_mapping=cam_name_mapping,
@@ -376,7 +390,7 @@ class WallxModelWrapper:
             prologue = f"{self.role_start_symbol}system\nYou are a helpful assistant.{self.role_end_symbol}\n"
         user_request = f"{self.role_start_symbol}user\nObservation:"
         camera_name_mapping = self._camera_name_mapping()
-        for cam_name in self.cam_names:
+        for cam_name in cams:
             user_request += (
                 f" {resolve_camera_label(cam_name, camera_name_mapping)}:"
                 f" {self.vision_start_symbol}{self.image_pad_symbol}{self.vision_end_symbol}"
@@ -397,14 +411,15 @@ class WallxModelWrapper:
         return prefix_text, postfix_text
 
     @timer
-    def get_text_for_action(self, instruction):
+    def get_text_for_action(self, instruction, cam_names=None):
+        cams = list(self.cam_names if cam_names is None else cam_names)
         if (
             self.config.train_config["data"].get("use_embodied_system_prompt_ratio", 0)
             > 0
         ):
             if self.norm_key not in ["x2_normal", "ex_normal"]:
                 self.config.robot_id = 0
-            cam_name_mapping = {cam_name: cam_name for cam_name in self.cam_names}
+            cam_name_mapping = {cam_name: cam_name for cam_name in cams}
             prologue = get_prologue_with_embodied_information(
                 dataset_name=self.norm_key,
                 cam_mapping=cam_name_mapping,
@@ -416,7 +431,7 @@ class WallxModelWrapper:
             prologue = f"{self.role_start_symbol}system\nYou are a helpful assistant.{self.role_end_symbol}\n"
         user_request = f"{self.role_start_symbol}user\nObservation:"
         camera_name_mapping = self._camera_name_mapping()
-        for cam_name in self.cam_names:
+        for cam_name in cams:
             user_request += (
                 f" {resolve_camera_label(cam_name, camera_name_mapping)}:"
                 f" {self.vision_start_symbol}{self.image_pad_symbol}{self.vision_end_symbol}"
@@ -435,11 +450,12 @@ class WallxModelWrapper:
         return prefix_text, postfix_text
 
     @timer
-    def get_text_for_subtask_generation(self, instruction):
+    def get_text_for_subtask_generation(self, instruction, cam_names=None):
+        cams = list(self.cam_names if cam_names is None else cam_names)
         prologue = f"{self.role_start_symbol}system\nYou are a helpful assistant.{self.role_end_symbol}\n"
         user_request = f"{self.role_start_symbol}user\nObservation:"
         camera_name_mapping = self._camera_name_mapping()
-        for cam_name in self.cam_names:
+        for cam_name in cams:
             user_request += (
                 f" {resolve_camera_label(cam_name, camera_name_mapping)}:"
                 f" {self.vision_start_symbol}{self.image_pad_symbol}{self.vision_end_symbol}"
@@ -545,7 +561,11 @@ class WallxModelWrapper:
         self.logger.info("generating flow action")
         self.logger.info(f"flow action instruction: {instruction}")
 
-        prefix_text, postfix_text = self.get_text_for_action(instruction)
+        cam_names = self._present_cam_names(observation)
+        self.logger.info("flow action cameras: %s", cam_names)
+        prefix_text, postfix_text = self.get_text_for_action(
+            instruction, cam_names=cam_names
+        )
         model_input = self.construct_model_input(
             [observation], [prefix_text], [postfix_text]
         )
@@ -612,8 +632,10 @@ class WallxModelWrapper:
 
         prefix_list = []
         postfix_list = []
-        for ins in instructions:
-            prefix_text, postfix_text = self.get_text_for_action(ins)
+        for obs, ins in zip(observations, instructions):
+            prefix_text, postfix_text = self.get_text_for_action(
+                ins, cam_names=self._present_cam_names(obs)
+            )
             prefix_list.append(prefix_text)
             postfix_list.append(postfix_text)
 
@@ -664,7 +686,9 @@ class WallxModelWrapper:
         self.logger.info("generating ar action")
         self.logger.info(f"ar action instruction: {instruction}")
 
-        prefix_text, _ = self.get_text_for_action(instruction)
+        prefix_text, _ = self.get_text_for_action(
+            instruction, cam_names=self._present_cam_names(observation)
+        )
         model_input = self.construct_model_input([observation], [prefix_text], [""])
 
         model_output = self.model.generate_ar_action(
@@ -687,7 +711,9 @@ class WallxModelWrapper:
         self.logger.info("generating subtask")
         self.logger.info(f"subtask instruction: {instruction}")
 
-        prefix_text, postfix_text = self.get_text_for_subtask_generation(instruction)
+        prefix_text, postfix_text = self.get_text_for_subtask_generation(
+            instruction, cam_names=self._present_cam_names(observation)
+        )
         model_input = self.construct_model_input([observation], [prefix_text], [""])
 
         model_output = self.model.generate_text(**model_input)
@@ -728,7 +754,9 @@ class WallxModelWrapper:
         self, observation, instruction, use_ar_action=False, dataset_name="x2_normal"
     ):
         assert self.model_type in ["qwen2_5"], "DLLM only supports qwen2_5"
-        prefix_text, postfix_text = self.get_text_for_dllm_action(instruction)
+        prefix_text, postfix_text = self.get_text_for_dllm_action(
+            instruction, cam_names=self._present_cam_names(observation)
+        )
         model_input = self.construct_model_input(
             [observation], [prefix_text], [postfix_text], pad_prefix=True
         )

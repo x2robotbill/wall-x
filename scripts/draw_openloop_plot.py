@@ -284,57 +284,108 @@ def _arm_follow_pos_from_agent_cfg(
     return packed.tolist()
 
 
+def _payload_from_agent_cfg(
+    state_vec: np.ndarray,
+    agent_cfg: dict[str, int],
+) -> dict[str, list[float]]:
+    """Pack agent_pos into websocket follow poses.
+
+    ``master_*`` is the same arm as ``follow_*``. Single-arm cup finetunes store
+    pos3 + rot6 + gripper under ``master_right_*``, which must become a 7D
+    ``follow2_pos`` (pos3 + euler3 + gripper) before the server ingests it.
+    """
+    payload: dict[str, list[float]] = {}
+    for prefixes, ws_key in (
+        (("follow_left_", "master_left_"), "follow1_pos"),
+        (("follow_right_", "master_right_"), "follow2_pos"),
+    ):
+        for prefix in prefixes:
+            if not any(str(key).startswith(prefix) for key in agent_cfg):
+                continue
+            packed = _arm_follow_pos_from_agent_cfg(state_vec, agent_cfg, prefix)
+            if packed is not None:
+                payload[ws_key] = packed
+            break
+    return payload
+
+
 def build_state_payload(
     state_vec: np.ndarray,
     train_config: dict[str, Any],
 ) -> dict[str, list[float]]:
     """Build websocket ``state`` dict from a flat proprio vector."""
     state_vec = np.asarray(state_vec, dtype=np.float32).reshape(-1)
+    agent_cfg = _agent_pos_config(train_config)
+    real_dim = real_vector_dim(agent_cfg) if agent_cfg else 0
+    padded_dim = sum(int(dim) for dim in agent_cfg.values()) if agent_cfg else 0
+
+    # Vectors that already match agent_pos_config (including 6D rotation and
+    # master_* keys) are not raw follow-pos. Pack them before the 7/14D shortcuts.
+    if agent_cfg and state_vec.shape[0] in (real_dim, padded_dim):
+        payload = _payload_from_agent_cfg(state_vec, agent_cfg)
+        if payload:
+            return payload
 
     # LeRobot dual-arm export in this workflow is already raw follow-pos 14D:
     # [L_pos3, L_rot3, L_grip1, R_pos3, R_rot3, R_grip1].
-    # Prefer direct passthrough and avoid parsing with agent_pos_config
-    # (which may be 6D/padded and would mis-slice a 14D state).
     if state_vec.shape[0] >= 14:
         return {
             "follow1_pos": state_vec[:7].tolist(),
             "follow2_pos": state_vec[7:14].tolist(),
         }
     if state_vec.shape[0] >= 7:
-        return {"follow2_pos": state_vec.tolist()}
+        return {"follow2_pos": state_vec[:7].tolist()}
 
-    agent_cfg = _agent_pos_config(train_config)
-
-    if agent_cfg:
-        has_left = any(k.startswith("follow_left_") for k in agent_cfg)
-        has_right = any(k.startswith("follow_right_") for k in agent_cfg)
-        payload: dict[str, list[float]] = {}
-        if has_left:
-            left = _arm_follow_pos_from_agent_cfg(state_vec, agent_cfg, "follow_left_")
-            if left is not None:
-                payload["follow1_pos"] = left
-        if has_right:
-            right = _arm_follow_pos_from_agent_cfg(
-                state_vec, agent_cfg, "follow_right_"
-            )
-            if right is not None:
-                payload["follow2_pos"] = right
-        if payload:
-            return payload
-
-        # Legacy single-arm LIBERO path: only follow_right_* in agent_pos_config.
-        real_dim = real_vector_dim(agent_cfg)
-        if real_dim > 0 and state_vec.shape[0] >= real_dim:
-            sliced = slice_by_config(state_vec, agent_cfg)
-            if sliced.shape[0] == 0:
-                sliced = state_vec[:real_dim]
-            right = _arm_follow_pos_from_agent_cfg(
-                state_vec, agent_cfg, "follow_right_"
-            )
-            if right is not None:
-                return {"follow2_pos": right}
-            return {"follow2_pos": sliced.tolist()}
     raise ValueError(f"Unsupported state dimension: {state_vec.shape[0]}")
+
+
+def _prediction_is_relative(dof_cfg: dict[str, int]) -> bool:
+    return any("relative" in str(key) for key in dof_cfg)
+
+
+def relative_chunk_to_absolute(
+    pred: np.ndarray,
+    state: np.ndarray,
+    dof_cfg: dict[str, int],
+) -> np.ndarray:
+    """Invert the training relative target so plots compare absolute actions.
+
+    Position: ``abs = follow_state + delta``.
+    6D rotation: ``R_abs = R_delta @ R_state``.
+    Gripper and other non-relative keys stay as predicted.
+    """
+    from wall_x._vendor.x2robot_utils.geometry import compose_state_and_delta_to_abs_6d
+
+    pred = np.asarray(pred, dtype=np.float64)
+    if pred.ndim == 1:
+        pred = pred[np.newaxis, :]
+    state = slice_by_config(np.asarray(state, dtype=np.float64).reshape(-1), dof_cfg)
+    if state.shape[0] != pred.shape[1]:
+        raise ValueError(
+            f"Cannot lift relative prediction {pred.shape} with state dim {state.shape[0]}"
+        )
+
+    parts: list[np.ndarray] = []
+    cur = 0
+    for key, dim in dof_cfg.items():
+        if key == "action_padding":
+            continue
+        dim = int(dim)
+        action_clip = pred[:, cur : cur + dim]
+        state_clip = state[cur : cur + dim]
+        key_s = str(key)
+        if "relative" not in key_s:
+            parts.append(action_clip)
+        elif "rotation" in key_s and "6D" in key_s:
+            parts.append(
+                compose_state_and_delta_to_abs_6d(action_clip, state_clip.reshape(-1))
+            )
+        else:
+            parts.append(action_clip + state_clip[np.newaxis, :])
+        cur += dim
+    if not parts:
+        return pred.astype(np.float32)
+    return np.concatenate(parts, axis=1).astype(np.float32)
 
 
 def decode_predict_action(
@@ -899,6 +950,13 @@ async def run_openloop_eval(
                 pred_chunk = extract_action_chunk_from_response(result, train_config)
                 if pred_chunk.ndim == 1:
                     pred_chunk = pred_chunk[np.newaxis, :]
+                if dof_cfg and _prediction_is_relative(dof_cfg):
+                    local_state_idx = idx - episode.frame_offset
+                    pred_chunk = relative_chunk_to_absolute(
+                        pred_chunk,
+                        episode.states[local_state_idx],
+                        dof_cfg,
+                    )
                 if pred_chunk.shape[1] != gt_full.shape[1]:
                     raise ValueError(
                         f"Prediction action dim {pred_chunk.shape[1]} does not match "

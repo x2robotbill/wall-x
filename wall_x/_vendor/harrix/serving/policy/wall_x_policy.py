@@ -89,6 +89,30 @@ class WallXPolicy(BasePolicy):
             raise ValueError("Failed to decode base64 image payload")
         return cv2.cvtColor(decoded_img, cv2.COLOR_BGR2RGB)
 
+    def _decode_views(self, views: Dict) -> None:
+        """Decode present camera payloads in place.
+
+        Missing views stay None so the robot preprocessor can omit them from
+        the model prompt and image inputs.
+        """
+        missing = [k for k, v in views.items() if v is None]
+        if missing:
+            logger.warning(
+                "Camera views missing (%d/%d): %s. Continuing with the remaining views.",
+                len(missing),
+                len(views),
+                ", ".join(missing),
+            )
+        if self.image_passing_mode == "base64":
+            for k, v in views.items():
+                if v is None:
+                    continue
+                views[k] = np.expand_dims(self._decode_base64_image(v), axis=0)
+            return
+        for k, img in views.items():
+            if isinstance(img, np.ndarray) and img.ndim == 3:
+                views[k] = np.expand_dims(img, axis=0)
+
     def reset(self) -> None:
         """Reset the policy state."""
         self.action_buffer = []
@@ -212,9 +236,8 @@ class WallXPolicy(BasePolicy):
         state = obs["state"]
         views = obs["views"]
         instruction = obs.get("instruction") or self.config.default_instruction or ""
-        if self.image_passing_mode == "base64":
-            for k, v in views.items():
-                views[k] = np.expand_dims(self._decode_base64_image(v), axis=0)
+        self._decode_views(views)
+        self._log_received_observation(state, views)
 
         with ScopeTimer("get_observation"):
             observation = self.robot_preprocessor.get_observation(state, views)
@@ -235,13 +258,55 @@ class WallXPolicy(BasePolicy):
         # Single-arm LIBERO has no left-arm EE to serialize; dual-arm follow1/follow2
         # layout would fail in get_serialized_actions. Return raw action chunks instead.
         if not self.serialize_actions or self._is_single_arm_right_only():
-            return self._pack_action_chunk_response(model_output)
+            response = self._pack_action_chunk_response(model_output)
+            self._log_predict_action(response.get("predict_action"))
+            return response
 
         return self.robot_preprocessor.get_serialized_actions(
             model_output, robot_action_interpolate_multiplier=1
         )  # interpolation on robot websocket client
 
     # -- Batch inference ----------------------------------------------
+
+    def _log_received_observation(self, state: Dict, views: Dict) -> None:
+        """Log that a client image arrived and the proprio sent with it."""
+        if not views:
+            logger.warning("request has no camera views")
+        for name, image in views.items():
+            if image is None:
+                logger.warning("received view %s is empty", name)
+                continue
+            arr = np.asarray(image)
+            logger.info(
+                "received view %s shape=%s dtype=%s",
+                name,
+                tuple(arr.shape),
+                arr.dtype,
+            )
+        follow = state.get("follow2_pos") if isinstance(state, dict) else None
+        if follow is not None:
+            logger.info(
+                "received follow2_pos %s",
+                np.round(np.asarray(follow, dtype=np.float32).reshape(-1)[:7], 4).tolist(),
+            )
+
+    def _log_predict_action(self, predict_action) -> None:
+        """Log the relative action chunk returned when serialization is off."""
+        if predict_action is None:
+            logger.warning("response has no predict_action")
+            return
+        action = np.asarray(predict_action, dtype=np.float32)
+        flat = action.reshape(-1, action.shape[-1]) if action.ndim >= 2 else action.reshape(1, -1)
+        row = flat[0, :10]
+        pos = flat[:, :3]
+        logger.info(
+            "predict_action shape=%s step0 pos_delta=%s rot6=%s gripper=%.4f max_abs_pos_delta=%.4f",
+            tuple(action.shape),
+            np.round(row[:3], 4).tolist(),
+            np.round(row[3:9], 4).tolist(),
+            float(row[9]) if row.shape[0] > 9 else float("nan"),
+            float(np.max(np.abs(pos))) if pos.size else float("nan"),
+        )
 
     def _preprocess_obs(self, obs: Dict):
         """Preprocess a single observation dict into (observation, instruction).
@@ -251,15 +316,7 @@ class WallXPolicy(BasePolicy):
         state = obs["state"]
         views = obs["views"]
         instruction = obs.get("instruction") or self.config.default_instruction or ""
-
-        if self.image_passing_mode == "base64":
-            for k, v in views.items():
-                views[k] = np.expand_dims(self._decode_base64_image(v), axis=0)
-        else:
-            # raw numpy: ensure (1, H, W, C)
-            for k, img in views.items():
-                if isinstance(img, np.ndarray) and img.ndim == 3:
-                    views[k] = np.expand_dims(img, axis=0)
+        self._decode_views(views)
 
         observation = self.robot_preprocessor.get_observation(state, views)
         return observation, instruction

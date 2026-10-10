@@ -69,17 +69,24 @@ def ingest_websocket_follow_pos(
     from wall_x._vendor.x2robot_utils import geometry as geom
 
     agent_cfg = resolve_agent_pos_config(config.train_config)
+    # master_* is the same arm pose as follow_*, used by single-arm finetunes
+    # whose dof keys are master_right_* / master_left_* rather than follow_*.
+
     arm_ws_keys = (
-        ("left", "follow1_pos", "follow_left_"),
-        ("right", "follow2_pos", "follow_right_"),
+        ("left", "follow1_pos", ("follow_left_", "master_left_")),
+        ("right", "follow2_pos", ("follow_right_", "master_right_")),
     )
-    for _side, ws_key, cfg_prefix in arm_ws_keys:
+    for _side, ws_key, cfg_prefixes in arm_ws_keys:
         if ws_key not in state or state[ws_key] is None:
             continue
         pos, euler, grip = _parse_follow_pos(state[ws_key])
+        # Keep the raw 7D pose so a single-arm checkpoint can hold the other arm.
+        robot_state_action_data.data[f"ws_{ws_key}"] = np.concatenate(
+            [pos.reshape(-1)[:3], euler.reshape(-1)[:3], grip.reshape(-1)[:1]]
+        )
         rot6d = geom.euler_to_matrix_zyx_6d_nb(euler.reshape(1, 3))
         for key in agent_cfg:
-            if key == "action_padding" or not key.startswith(cfg_prefix):
+            if key == "action_padding" or not key.startswith(cfg_prefixes):
                 continue
             if "cartesian_pos" in key:
                 robot_state_action_data.save_state_data_with_key(pos, key)
@@ -102,6 +109,37 @@ def ingest_websocket_follow_pos(
             robot_state_action_data.save_state_data_with_key(
                 np.zeros(int(dim), dtype=np.float64), key
             )
+
+
+def _configured_arm_sides(config: InferConfig) -> set[str]:
+    """Which arms this checkpoint actually predicts.
+
+    Single-arm cup finetunes only list ``master_right_*`` in ``dof_config``.
+    Serialization must not require the missing arm.
+    """
+    from wall_x._vendor.harrix.utils.train_config import resolve_dof_config
+
+    sides: set[str] = set()
+    for key in resolve_dof_config(config.train_config):
+        if key.startswith(("follow_left_", "master_left_")):
+            sides.add("left")
+        elif key.startswith(("follow_right_", "master_right_")):
+            sides.add("right")
+    return sides
+
+
+def _hold_follow_pos(
+    robot_state_action_data: RobotStateActionData,
+    ws_key: str,
+    length: int,
+) -> np.ndarray:
+    """Repeat the current arm pose so a client that requires both arms can execute."""
+    raw = robot_state_action_data.data.get(f"ws_{ws_key}")
+    pose = np.zeros(7, dtype=np.float64)
+    if raw is not None:
+        arr = np.asarray(raw, dtype=np.float64).reshape(-1)
+        pose[: min(7, arr.shape[0])] = arr[:7]
+    return np.repeat(pose.reshape(1, 7), max(int(length), 1), axis=0)
 
 
 def export_websocket_follow_pos(
@@ -484,11 +522,29 @@ class Robot(ABC):
         """
         assert "robot_state_action_data" in input
 
-        left_arm_action = self._get_left_arm_action(input["robot_state_action_data"])
-        right_arm_action = self._get_right_arm_action(input["robot_state_action_data"])
+        data = input["robot_state_action_data"]
+        sides = _configured_arm_sides(self.config) or {"left", "right"}
+        joint = bool(self.config.robot_use_joint_angle_control)
+        named: list[tuple[str, np.ndarray]] = []
+        if "left" in sides:
+            named.append(
+                (
+                    "follow1_joints" if joint else "follow1_pos",
+                    self._get_left_arm_action(data),
+                )
+            )
+        if "right" in sides:
+            named.append(
+                (
+                    "follow2_joints" if joint else "follow2_pos",
+                    self._get_right_arm_action(data),
+                )
+            )
+        if not named:
+            raise ValueError("dof_config has no arm keys to serialize")
 
         # Trim action
-        action_length = len(left_arm_action)
+        action_length = len(named[0][1])
         if robot_action_start_ratio is None:
             robot_action_start_ratio = self.config.robot_action_start_ratio
         if robot_action_end_ratio is None:
@@ -496,30 +552,32 @@ class Robot(ABC):
         start_frame = int(robot_action_start_ratio * action_length)
         end_frame = int(robot_action_end_ratio * action_length)
 
-        left_arm_action = left_arm_action[start_frame:end_frame]
-        right_arm_action = right_arm_action[start_frame:end_frame]
+        trimmed = [arr[start_frame:end_frame] for _, arr in named]
 
         # Interpolate
         if robot_action_interpolate_multiplier is None:
             robot_action_interpolate_multiplier = (
                 self.config.robot_action_interpolate_multiplier
             )
-        target_length = robot_action_interpolate_multiplier * len(left_arm_action)
-        left_arm_action, right_arm_action = (
-            UnifiedTrajectoryProcessor.interpolate_trajectory_batch(
-                [left_arm_action, right_arm_action], target_length
-            )
+        target_length = robot_action_interpolate_multiplier * len(trimmed[0])
+        interpolated = UnifiedTrajectoryProcessor.interpolate_trajectory_batch(
+            trimmed, target_length
         )
-
-        if not self.config.robot_use_joint_angle_control:
-            return {
-                "follow1_pos": left_arm_action.tolist(),
-                "follow2_pos": right_arm_action.tolist(),
-            }
-        return {
-            "follow1_joints": left_arm_action.tolist(),
-            "follow2_joints": right_arm_action.tolist(),
+        serialized = {
+            name: arr.tolist()
+            for (name, _), arr in zip(named, interpolated)
         }
+        if not joint:
+            hold_len = len(interpolated[0])
+            if "follow1_pos" not in serialized:
+                serialized["follow1_pos"] = _hold_follow_pos(
+                    data, "follow1_pos", hold_len
+                ).tolist()
+            if "follow2_pos" not in serialized:
+                serialized["follow2_pos"] = _hold_follow_pos(
+                    data, "follow2_pos", hold_len
+                ).tolist()
+        return serialized
 
     def apply_action(
         self,
@@ -1013,9 +1071,16 @@ class EX001Robot(Robot):
         """
         assert "robot_state_action_data" in input
 
-        left_arm_action = self._get_left_arm_action(input["robot_state_action_data"])
-        right_arm_action = self._get_right_arm_action(input["robot_state_action_data"])
-        action_length = len(left_arm_action)
+        data = input["robot_state_action_data"]
+        sides = _configured_arm_sides(self.config) or {"left", "right"}
+        named: list[tuple[str, np.ndarray]] = []
+        if "left" in sides:
+            named.append(("follow1_pos", self._get_left_arm_action(data)))
+        if "right" in sides:
+            named.append(("follow2_pos", self._get_right_arm_action(data)))
+        if not named:
+            raise ValueError("dof_config has no arm keys to serialize")
+        action_length = len(named[0][1])
 
         # action_length is 1 state frame + action_horizon action frames
         # Actual action length is action_length - 1
@@ -1030,27 +1095,31 @@ class EX001Robot(Robot):
         start_frame = 1 + int(robot_action_start_ratio * actual_action_length)
         end_frame = 1 + int(robot_action_end_ratio * actual_action_length)
 
-        left_arm_action = left_arm_action[start_frame:end_frame]
-        right_arm_action = right_arm_action[start_frame:end_frame]
+        trimmed = [arr[start_frame:end_frame] for _, arr in named]
 
         if robot_action_interpolate_multiplier is None:
             robot_action_interpolate_multiplier = (
                 self.config.robot_action_interpolate_multiplier
             )
-        target_length = robot_action_interpolate_multiplier * len(left_arm_action)
+        target_length = robot_action_interpolate_multiplier * len(trimmed[0])
 
-        (
-            left_arm_action,
-            right_arm_action,
-        ) = UnifiedTrajectoryProcessor.interpolate_trajectory_batch(
-            [left_arm_action, right_arm_action],
+        interpolated = UnifiedTrajectoryProcessor.interpolate_trajectory_batch(
+            trimmed,
             target_length,
         )
 
         serialized_actions = {
-            "follow1_pos": left_arm_action.tolist(),
-            "follow2_pos": right_arm_action.tolist(),
+            name: arr.tolist() for (name, _), arr in zip(named, interpolated)
         }
+        hold_len = len(interpolated[0])
+        if "follow1_pos" not in serialized_actions:
+            serialized_actions["follow1_pos"] = _hold_follow_pos(
+                data, "follow1_pos", hold_len
+            ).tolist()
+        if "follow2_pos" not in serialized_actions:
+            serialized_actions["follow2_pos"] = _hold_follow_pos(
+                data, "follow2_pos", hold_len
+            ).tolist()
 
         # Get head, lift, and velocity actions
         head_action = self._get_head_action(input["robot_state_action_data"])
@@ -1194,10 +1263,16 @@ class EX001RobotPreprocessor(EX001Robot):
                     )
                     break
             if not found:
-                self.logger.error(
-                    f"EX001RobotPreprocessor: no view for '{obs_key}', tried keys: {possible_view_keys}"
+                self.logger.warning(
+                    "EX001RobotPreprocessor: skipping '%s' (tried keys: %s)",
+                    obs_key,
+                    possible_view_keys,
                 )
-                # Black image placeholder
-                observation[obs_key] = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        if not any(name in observation for name in self.config.cam_names):
+            raise ValueError(
+                "EX001RobotPreprocessor: no camera images. "
+                f"Expected one of {list(self.config.cam_names)}."
+            )
 
         return observation

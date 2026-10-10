@@ -142,6 +142,12 @@ _DOF_DIM_MAPPING = {
     "follow_right_position": 3,
     "follow_right_rotation": 3,
     "follow_right_gripper": 1,
+    "master_left_position": 3,
+    "master_left_rotation": 3,
+    "master_left_gripper": 1,
+    "master_right_position": 3,
+    "master_right_rotation": 3,
+    "master_right_gripper": 1,
     "head_rotation": 2,
     "lifting_mechanism_position": 1,
     "car_pose": 3,
@@ -911,6 +917,32 @@ def get_video_num_frames(video_path: str):
     return count, first_frame_shape
 
 
+def _instruction_from_diversity(episode_path: str, spec: dict) -> str:
+    """Build one fixed instruction from a diversity field.
+
+    ``spec`` example::
+
+        {"file": "diversity.json", "key_path": ["diversity", "杯子颜色"],
+         "value_map": {"红色": "red"}, "template": "Pick up the {value} cup."}
+    """
+    path = os.path.join(episode_path, spec.get("file", "diversity.json"))
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+    node = payload
+    for part in spec.get("key_path", ["diversity", "杯子颜色"]):
+        if not isinstance(node, dict) or part not in node:
+            raise KeyError(f"{path} missing {spec.get('key_path')}")
+        node = node[part]
+    raw = "" if node is None else str(node).strip()
+    if not raw:
+        raise ValueError(f"{path} has an empty diversity value")
+    value_map = spec.get("value_map") or {}
+    if raw not in value_map:
+        raise KeyError(f"{path} value {raw!r} is not in value_map")
+    value = value_map[raw]
+    return spec["template"].format(value=value, raw=raw)
+
+
 def _stack_action_keys(data_dict: dict, keys: list[str]) -> np.ndarray:
     """Stack per-key action/state arrays into a single (T, D) matrix."""
     parts = []
@@ -1137,18 +1169,27 @@ def run_conversion(
 
         logger.info("Found %d episode folders in %s", len(episode_paths), src_path)
 
-        instructions_file = os.path.join(src_path, "instruction.json")
-        with open(instructions_file, encoding="utf-8") as f:
-            instruction_dict = json.load(f)
+        diversity_instruction = episode_template.get("instruction_from_diversity")
+        instruction_dict = {}
+        if not diversity_instruction:
+            instructions_file = os.path.join(src_path, "instruction.json")
+            with open(instructions_file, encoding="utf-8") as f:
+                instruction_dict = json.load(f)
 
         for episode_path in episode_paths:
+            if diversity_instruction:
+                instruction_info = _instruction_from_diversity(
+                    episode_path, diversity_instruction
+                )
+            else:
+                instruction_info = instruction_dict.get(
+                    os.path.basename(episode_path), {}
+                ).get("instruction", "")
             episode_item = {
                 **episode_template,
                 "path": episode_path,
                 "fps": fps,
-                "instruction_info": instruction_dict.get(
-                    os.path.basename(episode_path), {}
-                ).get("instruction", ""),
+                "instruction_info": instruction_info,
             }
             logger.info("Processing episode: %s", episode_path)
             try:
