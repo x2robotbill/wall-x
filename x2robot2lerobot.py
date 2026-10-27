@@ -145,6 +145,19 @@ _DOF_DIM_MAPPING = {
     "head_rotation": 2,
     "lifting_mechanism_position": 1,
     "car_pose": 3,
+    # CX002 whole-body wrist pose. Used when follow_* EE keys are absent.
+    "whole_body_left_wrist_position": 3,
+    "whole_body_left_wrist_rotation": 3,
+    "whole_body_right_wrist_position": 3,
+    "whole_body_right_wrist_rotation": 3,
+}
+
+# CX002 stores the follow wrist under whole_body_* instead of follow_*_position.
+_CX002_FOLLOW_RAW_ALIAS = {
+    "follow_left_position": "whole_body_left_wrist_position",
+    "follow_left_rotation": "whole_body_left_wrist_rotation",
+    "follow_right_position": "whole_body_right_wrist_position",
+    "follow_right_rotation": "whole_body_right_wrist_rotation",
 }
 
 
@@ -273,15 +286,26 @@ def process_action(
     keys_to_aggregate = {key for key in all_raw_keys if key in _DOF_DIM_MAPPING}
 
     aggregated_raw_data = defaultdict(list)
+    used_cx002_alias = set()
     for action in data:
         for key in keys_to_aggregate:
             if key in action:
                 aggregated_raw_data[key].append(action[key])
-            else:
-                # Pad missing values with NaN for consistent array shapes
-                aggregated_raw_data[key].append(
-                    [float("nan") for _ in range(_DOF_DIM_MAPPING[key])]
-                )
+                continue
+            alias = _CX002_FOLLOW_RAW_ALIAS.get(key)
+            if alias is not None and alias in action:
+                aggregated_raw_data[key].append(action[alias])
+                used_cx002_alias.add(f"{alias} -> {key}")
+                continue
+            # Pad missing values with NaN for consistent array shapes
+            aggregated_raw_data[key].append(
+                [float("nan") for _ in range(_DOF_DIM_MAPPING[key])]
+            )
+    if used_cx002_alias:
+        logger.info(
+            "CX002 wrist pose aliased onto follow EE keys: %s",
+            ", ".join(sorted(used_cx002_alias)),
+        )
 
     # Convert to NumPy arrays
     for key in aggregated_raw_data:
@@ -1103,6 +1127,7 @@ def resolve_run_config(args: argparse.Namespace) -> dict:
         "fps": float(fps),
         "features": features,
         "episode_template": episode_template,
+        "exclude_episodes": list(cfg.get("exclude_episodes") or []),
     }
 
 
@@ -1113,7 +1138,9 @@ def run_conversion(
     fps: float,
     features: dict,
     episode_template: dict,
+    exclude_episodes: list[str] | None = None,
 ) -> list[str]:
+    excluded = set(exclude_episodes or [])
     dataset = X2LeRobotDataset.create(
         repo_id=repo_id,
         root=output_path,
@@ -1130,6 +1157,9 @@ def run_conversion(
         episode_paths = []
         for item in os.listdir(src_path):
             if item == "record":
+                continue
+            if item in excluded:
+                logger.info("Excluded by config: %s", item)
                 continue
             item_path = os.path.join(src_path, item)
             if os.path.isdir(item_path):
